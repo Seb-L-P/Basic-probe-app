@@ -5,22 +5,43 @@ import subprocess
 import datetime
 import threading
 import time
-from flask import Flask, jsonify, request, send_file
+import logging
+from flask import Flask, jsonify, request, send_file, send_from_directory
 
-# Paths
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ---------- timezone-aware + sqlite adapters ----------
+UTC = datetime.timezone.utc
+
+def adapt_datetime(dt: datetime.datetime):
+    return dt.isoformat()
+
+def convert_datetime(s: bytes):
+    return datetime.datetime.fromisoformat(s.decode())
+
+sqlite3.register_adapter(datetime.datetime, adapt_datetime)
+sqlite3.register_converter("timestamp", convert_datetime)
+sqlite3.register_converter("DATETIME", convert_datetime)
+
+# ---------- paths / config ----------
 CONFIG_PATH = "config.yaml"
 DB_PATH = "monitoring.db"
 
-# Load config
-with open(CONFIG_PATH) as f:
-    config = yaml.safe_load(f)
+def load_config():
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
 
+config = load_config()
 INTERVAL = config.get("interval_seconds", 10)
 HOSTS = config.get("hosts", [])
 
-# Initialize database
+# ---------- database helpers ----------
+def get_conn():
+    return sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS probes (
@@ -35,53 +56,68 @@ def init_db():
     conn.commit()
     conn.close()
 
-def probe_host(address):
-    try:
-        proc = subprocess.run(["ping", "-c", "1", "-W", "1", address],
-                              capture_output=True, text=True, timeout=3)
-        output = proc.stdout
-        if proc.returncode == 0:
-            for part in output.split():
-                if "time=" in part:
-                    val = part.split("time=")[1]
-                    if val.endswith("ms"):
-                        val = val[:-2]
-                    return float(val)
-        return None
-    except Exception:
-        return None
-
 def insert_probe(host_name, host_address, latency, success):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
     INSERT INTO probes (host_name, host_address, timestamp, latency_ms, success)
     VALUES (?, ?, ?, ?, ?)
-    """, (host_name, host_address, datetime.datetime.utcnow(), latency, success))
+    """, (host_name, host_address, datetime.datetime.now(UTC), latency, success))
     conn.commit()
     conn.close()
 
+# ---------- probing ----------
+def probe_host(address):
+    try:
+        proc = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", address],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if proc.returncode == 0:
+            for part in proc.stdout.split():
+                if "time=" in part:
+                    val = part.split("time=")[1]
+                    if val.endswith("ms"):
+                        val = val[:-2]
+                    try:
+                        return float(val)
+                    except ValueError:
+                        continue
+        return None
+    except Exception as e:
+        logging.debug("Probe exception for %s: %s", address, e)
+        return None
+
 def probing_loop():
+    global config, HOSTS, INTERVAL
     while True:
+        try:
+            new_cfg = load_config()
+            if new_cfg != config:
+                logging.info("Config change detected, reloading")
+                config = new_cfg
+                HOSTS = config.get("hosts", [])
+                INTERVAL = config.get("interval_seconds", INTERVAL)
+        except Exception as e:
+            logging.warning("Failed to reload config: %s", e)
+
         for h in HOSTS:
             name = h.get("name")
             address = h.get("address")
             latency = probe_host(address)
             success = 1 if latency is not None else 0
             insert_probe(name, address, latency if success else None, success)
+            logging.debug("Probed %s (%s): up=%s latency=%s", name, address, bool(success), latency)
         time.sleep(INTERVAL)
 
-# Start probes
-init_db()
-thread = threading.Thread(target=probing_loop, daemon=True)
-thread.start()
-
-# Flask app
+# ---------- Flask app ----------
 app = Flask(__name__)
 
 @app.route("/status")
 def status():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
     result = []
     for h in HOSTS:
@@ -92,14 +128,28 @@ def status():
         WHERE host_name=? ORDER BY timestamp DESC LIMIT 1
         """, (name,))
         row = cur.fetchone()
+        uptime_60m = None
+        since = datetime.datetime.now(UTC) - datetime.timedelta(minutes=60)
+        cur.execute("""
+            SELECT COUNT(*), SUM(success) FROM probes
+            WHERE host_name=? AND timestamp >= ?
+        """, (name, since))
+        total, succ = cur.fetchone() or (0, 0)
+        if total and total > 0:
+            try:
+                uptime_60m = 100.0 * (succ or 0) / total
+            except Exception:
+                uptime_60m = None
+
         if row:
             ts, latency, success = row
             result.append({
                 "name": name,
                 "address": address,
-                "timestamp": ts,
+                "timestamp": ts.isoformat() + "Z" if isinstance(ts, datetime.datetime) else ts,
                 "latency_ms": latency,
-                "up": bool(success)
+                "up": bool(success),
+                "uptime_60m": uptime_60m,
             })
         else:
             result.append({
@@ -107,7 +157,8 @@ def status():
                 "address": address,
                 "timestamp": None,
                 "latency_ms": None,
-                "up": False
+                "up": False,
+                "uptime_60m": uptime_60m,
             })
     conn.close()
     return jsonify(result)
@@ -118,8 +169,8 @@ def history():
     minutes = int(request.args.get("minutes", "60"))
     if not host_name:
         return jsonify({"error": "missing name parameter"}), 400
-    since = datetime.datetime.utcnow() - datetime.timedelta(minutes=minutes)
-    conn = sqlite3.connect(DB_PATH)
+    since = datetime.datetime.now(UTC) - datetime.timedelta(minutes=minutes)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
     SELECT timestamp, latency_ms, success FROM probes
@@ -130,7 +181,7 @@ def history():
     for row in cur.fetchall():
         ts, latency, success = row
         data.append({
-            "timestamp": ts,
+            "timestamp": ts.isoformat() + "Z" if isinstance(ts, datetime.datetime) else ts,
             "latency_ms": latency,
             "up": bool(success)
         })
@@ -141,9 +192,26 @@ def history():
         "data": data
     })
 
+@app.route("/config")
+def get_config():
+    return send_file(CONFIG_PATH, mimetype="text/yaml")
+
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "time_utc": datetime.datetime.utcnow().isoformat() + "Z"})
+    return jsonify({"status": "ok", "time_utc": datetime.datetime.now(UTC).isoformat() + "Z"})
 
+@app.route("/")
+def dashboard():
+    frontend_path = os.path.join("web", "dashboard.html")
+    if os.path.exists(frontend_path):
+        return send_from_directory("web", "dashboard.html")
+    return "<p>Dashboard not found. Create web/dashboard.html</p>", 404
+
+# ---------- bootstrap ----------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    init_db()
+    thread = threading.Thread(target=probing_loop, daemon=True)
+    thread.start()
+    port = int(os.environ.get("PORT", "5000"))
+    logging.info("Starting app on port %s", port)
+    app.run(host="0.0.0.0", port=port)

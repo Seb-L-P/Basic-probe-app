@@ -1,18 +1,329 @@
 <!doctype html>
-<html>
-<head><title>Network Monitor</title></head>
-<body>
-  <h1>Network Monitor Status</h1>
-  <div id="status"></div>
-  <script>
-    async function fetchStatus() {
-      const res = await fetch("/status");
-      const data = await res.json();
-      const container = document.getElementById("status");
-      container.innerHTML = "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Network Monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --radius: 8px;
+      --shadow: 0 10px 25px -10px rgba(0,0,0,0.1);
+      --gap: 16px;
+      font-family: system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+      background: #f5f7fa;
+      color: #1f2d3a;
     }
-    setInterval(fetchStatus, 5000);
+    body {
+      margin: 0;
+      padding: 24px;
+      max-width: 1100px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 { margin-top: 0; font-size: 1.8rem; }
+    .flex { display: flex; gap: var(--gap); flex-wrap: wrap; }
+    .card {
+      background: white;
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: var(--shadow);
+      flex: 1 1 300px;
+      position: relative;
+      min-width: 240px;
+    }
+    .host-select {
+      margin-bottom: 8px;
+    }
+    .status-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.9rem;
+    }
+    .status-table th, .status-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #e1e8f0;
+      text-align: left;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+    .up { background: #d1ffe0; color: #07652d; }
+    .down { background: #ffe0e0; color: #a92525; }
+    .small { font-size: 0.75rem; color: #555; }
+    #alert { position: absolute; top: 12px; right: 12px; }
+    .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+    .alert-active { background: #ff4d4f; }
+    .uptime-text { font-size: 0.85rem; margin-top: 4px; }
+    .spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid rgba(0,0,0,0.1);
+      border-top-color: #0057ff;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error { background: #fff0f0; padding: 8px 12px; border: 1px solid #f5c2c7; border-radius: 6px; margin-top: 12px; }
+    .legend { font-size: 0.75rem; margin-top: 4px; }
+    .nowrap { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <h1>Network Monitoring Dashboard</h1>
+
+  <div class="flex" style="align-items: flex-start;">
+    <div class="card" style="flex: 2 1 500px;">
+      <div style="display:flex; justify-content: space-between; align-items: baseline;">
+        <div>
+          <label for="host-select"><strong>Host:</strong></label>
+          <select id="host-select" class="host-select"></select>
+          <span id="refresh-info" class="small"></span>
+        </div>
+        <div id="alert" aria-label="alert-indicator"></div>
+      </div>
+
+      <div id="status-summary" style="margin-top: 12px;"></div>
+
+      <div class="flex" style="margin-top:16px; gap: 32px;">
+        <div style="flex:1 1 300px;">
+          <canvas id="latencyChart" height="180"></canvas>
+          <div class="legend">Latency over last 60 minutes (gaps = downtime)</div>
+        </div>
+        <div style="flex:0 0 180px; text-align:center;">
+          <canvas id="uptimeGauge" width="160" height="160"></canvas>
+          <div class="uptime-text">Uptime (60m)</div>
+          <div id="uptime-percent" style="font-weight:600; font-size:1.2rem;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="flex:1 1 260px;">
+      <div><strong>All Hosts Snapshot</strong></div>
+      <div id="all-status" style="margin-top:8px;"></div>
+      <div class="small legend">
+        Green tick = up; red cross = down. Uptime is last 60 minutes.
+      </div>
+    </div>
+  </div>
+
+  <div id="error-box"></div>
+
+  <script>
+    let latencyChart = null;
+    let uptimeGauge = null;
+    let lastHistoryData = null;
+    const FAILURE_STREAK_THRESHOLD = 3;
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch("/status");
+        if (!res.ok) throw new Error("Status fetch failed: " + res.status);
+        const hosts = await res.json();
+        populateHostSelect(hosts);
+        renderAllHostsSnapshot(hosts);
+        const selected = document.getElementById("host-select").value || (hosts[0] && hosts[0].name);
+        if (selected) {
+          await loadHostDetails(selected, hosts);
+        }
+        document.getElementById("refresh-info").textContent = "Updated: " + new Date().toLocaleTimeString();
+        clearError();
+      } catch (e) {
+        showError("Failed to fetch status: " + e.message);
+      }
+    }
+
+    function populateHostSelect(hosts) {
+      const sel = document.getElementById("host-select");
+      const prev = sel.value;
+      sel.innerHTML = "";
+      hosts.forEach(h => {
+        const o = document.createElement("option");
+        o.value = h.name;
+        o.textContent = `${h.name} (${h.address})`;
+        sel.appendChild(o);
+      });
+      if (hosts.find(h => h.name === prev)) {
+        sel.value = prev;
+      }
+    }
+
+    function renderAllHostsSnapshot(hosts) {
+      const container = document.getElementById("all-status");
+      container.innerHTML = "";
+      const table = document.createElement("table");
+      table.className = "status-table";
+      const header = document.createElement("tr");
+      header.innerHTML = "<th>Host</th><th>Up</th><th>Latency</th><th>Uptime 60m</th>";
+      table.appendChild(header);
+      hosts.forEach(h => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="nowrap">${h.name}</td>
+          <td>${h.up ? '<span class="badge up">✓</span>' : '<span class="badge down">✗</span>'}</td>
+          <td>${h.latency_ms !== null ? h.latency_ms.toFixed(1) + " ms" : "-"}</td>
+          <td>${h.uptime_60m !== null ? h.uptime_60m.toFixed(1) + "%" : "-"}</td>
+        `;
+        table.appendChild(tr);
+      });
+      container.appendChild(table);
+    }
+
+    async function loadHostDetails(hostName, hosts) {
+      // find the host object (for address)
+      const hostObj = hosts.find(h => h.name === hostName);
+      if (!hostObj) return;
+
+      // Summary area
+      const summary = document.getElementById("status-summary");
+      summary.innerHTML = `
+        <div style="display:flex; gap:16px; flex-wrap:wrap;">
+          <div><strong>${hostObj.name}</strong> (${hostObj.address})</div>
+          <div>${hostObj.up ? '<span class="badge up">UP</span>' : '<span class="badge down">DOWN</span>'}</div>
+          <div>Latency: ${hostObj.latency_ms !== null ? hostObj.latency_ms.toFixed(1) + " ms" : "-"}</div>
+          <div>Uptime 60m: ${hostObj.uptime_60m !== null ? hostObj.uptime_60m.toFixed(1) + "%" : "-"}</div>
+          <div>Last seen: ${hostObj.timestamp || "-"}</div>
+        </div>
+      `;
+
+      // Load history
+      await updateHistoryChart(hostName);
+      updateUptimeGauge();
+      checkAlertCondition();
+    }
+
+    async function updateHistoryChart(hostName) {
+      try {
+        const res = await fetch(`/history?name=${encodeURIComponent(hostName)}&minutes=60`);
+        if (!res.ok) throw new Error("History fetch failed");
+        const body = await res.json();
+        lastHistoryData = body.data;
+
+        const labels = body.data.map(d => new Date(d.timestamp).toLocaleTimeString());
+        const latencies = body.data.map(d => d.latency_ms);
+        const ups = body.data.map(d => d.up);
+
+        // Build dataset with nulls for downtime (Chart.js will show gaps)
+        const dataset = latencies.map((v, i) => (ups[i] ? v : null));
+
+        // Create or update chart
+        const ctx = document.getElementById("latencyChart").getContext("2d");
+        if (latencyChart) latencyChart.destroy();
+        latencyChart = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [{
+              label: "Latency (ms)",
+              data: dataset,
+              spanGaps: false,
+              tension: 0.3,
+              borderWidth: 2,
+              pointRadius: 3,
+              pointHoverRadius: 6,
+              borderColor: "#0057ff",
+              backgroundColor: "rgba(0,87,255,0.1)"
+            }]
+          },
+          options: {
+            responsive: true,
+            scales: {
+              y: {
+                beginAtZero: true,
+                title: { display: true, text: "Latency (ms)" }
+              }
+            },
+            plugins: {
+              tooltip: {
+                mode: "index",
+                intersect: false,
+                callbacks: {
+                  label: ctx => {
+                    const v = ctx.raw;
+                    return v !== null ? ` ${v.toFixed(1)} ms` : " Down";
+                  }
+                }
+              }
+            }
+          }
+        });
+      } catch (e) {
+        showError("Failed to load history: " + e.message);
+      }
+    }
+
+    function updateUptimeGauge() {
+      if (!lastHistoryData) return;
+      const total = lastHistoryData.length;
+      const upCount = lastHistoryData.filter(d => d.up).length;
+      const percent = total ? Math.round((upCount / total) * 100) : 0;
+      document.getElementById("uptime-percent").textContent = `${percent}%`;
+
+      const ctx = document.getElementById("uptimeGauge").getContext("2d");
+      if (uptimeGauge) uptimeGauge.destroy();
+      uptimeGauge = new Chart(ctx, {
+        type: "doughnut",
+        data: {
+          labels: ["Up", "Down"],
+          datasets: [{
+            data: [upCount, Math.max(0, total - upCount)],
+            backgroundColor: ["#22c55e", "#ef4444"],
+            hoverOffset: 4,
+            borderWidth: 0
+          }]
+        },
+        options: {
+          cutout: "70%",
+          plugins: {
+            tooltip: { enabled: false }
+          }
+        }
+      });
+    }
+
+    function checkAlertCondition() {
+      if (!lastHistoryData) return;
+      // Find last consecutive failures (from most recent backwards)
+      let streak = 0;
+      for (let i = lastHistoryData.length - 1; i >= 0; i--) {
+        if (!lastHistoryData[i].up) streak++;
+        else break;
+      }
+      const alertEl = document.getElementById("alert");
+      alertEl.innerHTML = "";
+      if (streak >= FAILURE_STREAK_THRESHOLD) {
+        const dot = document.createElement("span");
+        dot.className = "dot alert-active";
+        alertEl.appendChild(dot);
+        const label = document.createElement("span");
+        label.textContent = `ALERT: ${streak} failed probes in a row`;
+        alertEl.appendChild(label);
+      }
+    }
+
+    function showError(msg) {
+      const box = document.getElementById("error-box");
+      box.innerHTML = `<div class="error">${msg}</div>`;
+    }
+
+    function clearError() {
+      document.getElementById("error-box").innerHTML = "";
+    }
+
+    document.getElementById("host-select").addEventListener("change", e => {
+      fetchStatus(); // reload details for new selection
+    });
+
+    // Kick off
     fetchStatus();
+    setInterval(fetchStatus, 10000);
   </script>
 </body>
 </html>
