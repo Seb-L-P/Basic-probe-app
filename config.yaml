@@ -1,0 +1,6 @@
+hosts:
+  - name: google-dns
+    address: 8.8.8.8
+  - name: example
+    address: example.com
+interval_seconds: 10
